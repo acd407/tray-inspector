@@ -1,0 +1,8 @@
+[package]
+name = "tray-inspector"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustbus = "0.19"
+clap = { version = "4", features = ["derive"] }
