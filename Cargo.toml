@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 rustbus = "0.19"
 clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }

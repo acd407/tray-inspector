@@ -1,7 +1,10 @@
+#![allow(clippy::mutable_key_type)]
+
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use rustbus::connection::{Timeout, ll_conn::DuplexConn};
+use rustbus::connection::{ll_conn::DuplexConn, Timeout};
 use rustbus::message_builder::{MarshalledMessage, MessageBuilder, MessageType};
 use rustbus::params::{Base, Container, DictMap, Param};
 
@@ -13,7 +16,10 @@ const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 const MENU_IFACE: &str = "com.canonical.dbusmenu";
 
 #[derive(Parser)]
-#[command(name = "tray-inspector", about = "Inspect system tray items and their menus")]
+#[command(
+    name = "tray-inspector",
+    about = "Inspect system tray items and their menus"
+)]
 struct Args {
     #[arg(short, long, help = "Show full properties")]
     verbose: bool,
@@ -26,6 +32,12 @@ struct Args {
 
     #[arg(long, help = "Filter by item ID")]
     id: Option<String>,
+
+    #[arg(short, long, help = "Display tray icon in terminal")]
+    icon: bool,
+
+    #[arg(long, help = "Resize icon to specified pixel size (largest dimension)")]
+    size: Option<u32>,
 }
 
 fn main() {
@@ -59,7 +71,8 @@ fn main() {
         return;
     }
 
-    let brief = !args.verbose && !args.menu && args.name.is_none() && args.id.is_none();
+    let brief =
+        !args.verbose && !args.menu && !args.icon && args.name.is_none() && args.id.is_none();
 
     if brief {
         print_items_brief(&items);
@@ -78,6 +91,46 @@ fn main() {
             println!("{top}");
             for (key, val) in &lines {
                 println!("{}", fmt_line(key, val));
+                if args.icon && *key == "IconPixmap" {
+                    if let Some(icon) = item_props.icons.iter().max_by_key(|i| i.width * i.height) {
+                        let mut pixels = icon.pixels.clone();
+                        let mut w = icon.width as u32;
+                        let mut h = icon.height as u32;
+                        if let Some(size) = args.size {
+                            let (new_w, new_h) = if w > h {
+                                let nh = (size as f64 * h as f64 / w as f64).round() as u32;
+                                (size, nh.max(1))
+                            } else {
+                                let nw = (size as f64 * w as f64 / h as f64).round() as u32;
+                                (nw.max(1), size)
+                            };
+                            let img = image::DynamicImage::ImageRgba8(
+                                image::RgbaImage::from_raw(w, h, pixels).unwrap(),
+                            );
+                            let resized =
+                                img.resize_exact(new_w, new_h, image::imageops::CatmullRom);
+                            let rgba = resized.into_rgba8();
+                            pixels = rgba.into_raw();
+                            w = new_w;
+                            h = new_h;
+                        }
+                        let icon_rows = h.div_ceil(16);
+                        print!("│ ");
+                        print!("\x1b[{}C", max_key + 2);
+                        std::io::stdout().flush().unwrap();
+                        display_icon_rgba(w, h, &pixels);
+                        for _ in 0..icon_rows {
+                            print!("\x1b[A\x1b[G│ ");
+                        }
+                        for _ in 0..icon_rows {
+                            print!("\x1b[B");
+                        }
+                        print!("\x1b[G");
+                        std::io::stdout().flush().unwrap();
+                    } else {
+                        println!("│ (no icon data)");
+                    }
+                }
             }
 
             if args.menu {
@@ -103,12 +156,16 @@ fn main() {
 fn connect() -> Result<DuplexConn, String> {
     let path = rustbus::get_session_bus_path().map_err(|e| e.to_string())?;
     let mut conn = DuplexConn::connect_to_bus(path, false).map_err(|e| e.to_string())?;
-    conn.send_hello(Timeout::Infinite).map_err(|e| e.to_string())?;
+    conn.send_hello(Timeout::Infinite)
+        .map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
 fn do_call(conn: &mut DuplexConn, msg: MarshalledMessage) -> Result<MarshalledMessage, String> {
-    let serial = conn.send.send_message_write_all(&msg).map_err(|e| e.to_string())?;
+    let serial = conn
+        .send
+        .send_message_write_all(&msg)
+        .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -139,8 +196,12 @@ fn get_registered_items(conn: &mut DuplexConn) -> Result<Vec<(String, String)>, 
         .with_interface(PROPS_IFACE)
         .at(WATCHER_BUS)
         .build();
-    call.body.push_param(WATCHER_IFACE).map_err(|e| e.to_string())?;
-    call.body.push_param("RegisteredStatusNotifierItems").map_err(|e| e.to_string())?;
+    call.body
+        .push_param(WATCHER_IFACE)
+        .map_err(|e| e.to_string())?;
+    call.body
+        .push_param("RegisteredStatusNotifierItems")
+        .map_err(|e| e.to_string())?;
 
     let reply = do_call(conn, call)?;
 
@@ -174,10 +235,17 @@ fn parse_address(address: &str) -> (String, String) {
     }
 }
 
+struct IconData {
+    width: i32,
+    height: i32,
+    pixels: Vec<u8>,
+}
+
 struct ItemProps {
     props: std::collections::HashMap<String, String>,
     id: String,
     title: String,
+    icons: Vec<IconData>,
 }
 
 fn get_item_properties(
@@ -203,12 +271,16 @@ fn get_item_properties(
     };
 
     let mut props = std::collections::HashMap::new();
+    let mut icons = Vec::new();
     for (key, val) in &dict.map {
         let k = match key {
             Base::StringRef(s) => s.to_string(),
             Base::String(s) => s.clone(),
             _ => continue,
         };
+        if k == "IconPixmap" {
+            icons = parse_icon_pixmap(val);
+        }
         let v = extract_prop_string(val);
         props.insert(k, v);
     }
@@ -216,7 +288,12 @@ fn get_item_properties(
     let id = props.get("Id").cloned().unwrap_or_default();
     let title = props.get("Title").cloned().unwrap_or_default();
 
-    Ok(ItemProps { props, id, title })
+    Ok(ItemProps {
+        props,
+        id,
+        title,
+        icons,
+    })
 }
 
 fn extract_prop_string(param: &Param) -> String {
@@ -231,9 +308,7 @@ fn extract_prop_string(param: &Param) -> String {
         Param::Base(Base::ObjectPath(p)) => p.clone(),
         Param::Base(Base::Int32(i)) => i.to_string(),
         Param::Base(Base::Uint32(i)) => i.to_string(),
-        Param::Base(Base::Boolean(b)) => {
-            (if *b { "true" } else { "false" }).to_string()
-        }
+        Param::Base(Base::Boolean(b)) => (if *b { "true" } else { "false" }).to_string(),
         Param::Base(Base::Byte(b)) => b.to_string(),
         Param::Base(Base::Int16(i)) => i.to_string(),
         Param::Base(Base::Uint16(i)) => i.to_string(),
@@ -250,6 +325,92 @@ fn extract_prop_string(param: &Param) -> String {
     }
 }
 
+fn parse_icon_pixmap(param: &Param) -> Vec<IconData> {
+    let inner = match param {
+        Param::Container(Container::Variant(v)) => &v.value,
+        _ => return vec![],
+    };
+    let array = match inner {
+        Param::Container(Container::Array(arr)) => arr,
+        _ => return vec![],
+    };
+
+    let mut icons = Vec::new();
+    for val in &array.values {
+        let fields = match val {
+            Param::Container(Container::Struct(s)) => s,
+            _ => continue,
+        };
+        if fields.len() < 3 {
+            continue;
+        }
+        let width = match &fields[0] {
+            Param::Base(Base::Int32(w)) => *w,
+            Param::Base(Base::Uint32(w)) => *w as i32,
+            _ => continue,
+        };
+        let height = match &fields[1] {
+            Param::Base(Base::Int32(h)) => *h,
+            Param::Base(Base::Uint32(h)) => *h as i32,
+            _ => continue,
+        };
+        if width <= 0 || height <= 0 {
+            continue;
+        }
+        let mut pixels: Vec<u8> = match &fields[2] {
+            Param::Container(Container::Array(arr)) => arr
+                .values
+                .iter()
+                .filter_map(|p| match p {
+                    Param::Base(Base::Byte(b)) => Some(*b),
+                    _ => None,
+                })
+                .collect(),
+            _ => continue,
+        };
+        if pixels.len() as i32 != width * height * 4 {
+            continue;
+        }
+        // Wire format is ARGB32 big-endian: [A, R, G, B] per pixel.
+        // Convert to RGBA: [R, G, B, A].
+        for pixel in pixels.chunks_exact_mut(4) {
+            let a = pixel[0];
+            let r = pixel[1];
+            let g = pixel[2];
+            pixel[0] = r;
+            pixel[1] = g;
+            pixel[2] = pixel[3];
+            pixel[3] = a;
+        }
+        icons.push(IconData {
+            width,
+            height,
+            pixels,
+        });
+    }
+    icons
+}
+
+fn display_icon_rgba(width: u32, height: u32, data: &[u8]) {
+    let img = match image::RgbaImage::from_raw(width, height, data.to_vec()) {
+        Some(i) => i,
+        None => return,
+    };
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("tray-inspector-{width}x{height}.png"));
+    let ok = match std::fs::File::create(&path) {
+        Ok(mut f) => img.write_to(&mut f, image::ImageFormat::Png).is_ok(),
+        Err(_) => false,
+    };
+    if !ok {
+        return;
+    }
+
+    let _ = std::process::Command::new("chafa").arg(&path).status();
+    let _ = std::fs::remove_file(&path);
+}
+
 fn collect_items(
     conn: &mut DuplexConn,
     addresses: &[(String, String)],
@@ -258,8 +419,8 @@ fn collect_items(
     let mut items = Vec::new();
     for (bus_name, object_path) in addresses {
         if let Ok(props) = get_item_properties(conn, bus_name, object_path) {
-            let match_name = args.name.as_ref().map_or(true, |n| props.title == *n);
-            let match_id = args.id.as_ref().map_or(true, |n| props.id == *n);
+            let match_name = args.name.as_ref().is_none_or(|n| props.title == *n);
+            let match_id = args.id.as_ref().is_none_or(|n| props.id == *n);
             if match_name && match_id {
                 items.push((bus_name.clone(), object_path.clone(), props));
             }
@@ -270,26 +431,52 @@ fn collect_items(
 
 fn print_items_brief(items: &[(String, String, ItemProps)]) {
     for (i, (addr, _path, props)) in items.iter().enumerate() {
-        let title = if props.title.is_empty() { "(unnamed)" } else { &props.title };
+        let title = if props.title.is_empty() {
+            "(unnamed)"
+        } else {
+            &props.title
+        };
         let id = &props.id;
-        let cat = props.props.get("Category").map(|s| s.as_str()).unwrap_or("-");
+        let cat = props
+            .props
+            .get("Category")
+            .map(|s| s.as_str())
+            .unwrap_or("-");
         let st = props.props.get("Status").map(|s| s.as_str()).unwrap_or("-");
         println!("{}. {title}  [{cat}/{st}]  id={id}  addr={addr}", i + 1);
     }
 }
 
-fn build_item_lines<'a>(bus_name: &'a str, object_path: &'a str, props: &'a ItemProps) -> Vec<(&'a str, String)> {
+fn build_item_lines<'a>(
+    bus_name: &'a str,
+    object_path: &'a str,
+    props: &'a ItemProps,
+) -> Vec<(&'a str, String)> {
     let mut lines: Vec<(&str, String)> = Vec::new();
 
     lines.push(("Bus name", bus_name.to_string()));
     lines.push(("Object path", object_path.to_string()));
     lines.push(("ID", props.id.clone()));
-    lines.push(("Title", if props.title.is_empty() { "-".into() } else { props.title.clone() }));
+    lines.push((
+        "Title",
+        if props.title.is_empty() {
+            "-".into()
+        } else {
+            props.title.clone()
+        },
+    ));
 
     for key in [
-        "Category", "Status", "WindowId", "IconName", "IconThemePath",
-        "OverlayIconName", "AttentionIconName", "AttentionMovieName",
-        "ItemIsMenu", "Menu",
+        "Category",
+        "Status",
+        "WindowId",
+        "IconName",
+        "IconThemePath",
+        "OverlayIconName",
+        "AttentionIconName",
+        "AttentionMovieName",
+        "ItemIsMenu",
+        "Menu",
     ] {
         if let Some(val) = props.props.get(key) {
             if !val.is_empty() && val != "0" {
@@ -300,13 +487,16 @@ fn build_item_lines<'a>(bus_name: &'a str, object_path: &'a str, props: &'a Item
 
     if let Some(tip) = props.props.get("ToolTip") {
         if tip.starts_with('(') && tip.ends_with(')') {
-            let inner = &tip[1..tip.len()-1];
+            let inner = &tip[1..tip.len() - 1];
             let parts: Vec<&str> = inner.splitn(4, ", ").collect();
             if parts.len() == 4 {
                 let title = parts[2].trim_matches(',');
                 let desc = parts[3].trim_matches(',');
                 if !title.is_empty() || !desc.is_empty() {
-                    lines.push(("ToolTip", format!("icon={} title={} desc={}", parts[0], title, desc)));
+                    lines.push((
+                        "ToolTip",
+                        format!("icon={} title={} desc={}", parts[0], title, desc),
+                    ));
                 }
             }
         }
@@ -391,15 +581,9 @@ fn parse_menu_node(param: &Param) -> Option<MenuNode> {
         _ => return None,
     };
 
-    let get_str = |key: &str| -> String {
-        get_variant_str(props, key)
-    };
-    let get_bool = |key: &str| -> Option<bool> {
-        get_variant_bool(props, key)
-    };
-    let get_int = |key: &str| -> Option<i32> {
-        get_variant_int(props, key)
-    };
+    let get_str = |key: &str| -> String { get_variant_str(props, key) };
+    let get_bool = |key: &str| -> Option<bool> { get_variant_bool(props, key) };
+    let get_int = |key: &str| -> Option<i32> { get_variant_int(props, key) };
 
     let label = get_str("label");
     let enabled = get_bool("enabled").unwrap_or(true);
@@ -484,14 +668,30 @@ fn print_menu_node(node: &MenuNode, depth: usize) {
         return;
     }
 
-    let label = if node.label.is_empty() { "(unnamed)" } else { &node.label };
+    let label = if node.label.is_empty() {
+        "(unnamed)"
+    } else {
+        &node.label
+    };
     let flags = {
         let mut f = String::new();
-        if !node.enabled { f.push_str(" [disabled]"); }
-        if !node.visible { f.push_str(" [hidden]"); }
+        if !node.enabled {
+            f.push_str(" [disabled]");
+        }
+        if !node.visible {
+            f.push_str(" [hidden]");
+        }
         match node.toggle_type.as_str() {
-            "checkmark" => f.push_str(if node.toggle_state == 1 { " [✓]" } else { " [ ]" }),
-            "radio" => f.push_str(if node.toggle_state == 1 { " [●]" } else { " [○]" }),
+            "checkmark" => f.push_str(if node.toggle_state == 1 {
+                " [✓]"
+            } else {
+                " [ ]"
+            }),
+            "radio" => f.push_str(if node.toggle_state == 1 {
+                " [●]"
+            } else {
+                " [○]"
+            }),
             _ => {}
         }
         f
